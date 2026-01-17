@@ -8,6 +8,7 @@ import EventDetail from "./pages/EventDetail";
 import Auth from "./pages/Auth";
 import MyTickets from "./pages/MyTickets";
 import OrganizerDashboard from "./pages/OrganizerDashboard";
+import OrganizerTeamSelection from "./pages/OrganizerTeamSelection";
 import ArtistDashboard from "./pages/ArtistDashboard";
 import AdminDashboard from "./pages/AdminDashboard";
 import NotFound from "./pages/NotFound";
@@ -27,6 +28,7 @@ const App = () => (
           <Route path="/event/:id" element={<EventDetail />} />
           <Route path="/auth" element={<Auth />} />
           <Route path="/my-tickets" element={<MyTickets />} />
+          <Route path="/organizer-team-selection" element={<OrganizerTeamSelection />} />
           <Route path="/organizer" element={<OrganizerDashboard />} />
           <Route path="/artist" element={<ArtistDashboard />} />
           <Route path="/admin" element={<AdminDashboard />} />

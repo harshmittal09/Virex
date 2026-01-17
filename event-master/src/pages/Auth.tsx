@@ -22,14 +22,17 @@ import {
   sendPasswordResetEmail,
   updateProfile
 } from "firebase/auth";
-import { auth } from "@/lib/firebase";
+import { auth, db } from "@/lib/firebase";
+import { doc, setDoc, getDoc } from "firebase/firestore";
 
 type AuthMode = "login" | "signup" | "forgot";
+type UserRole = "user" | "organizer" | "artist";
 
 const Auth = () => {
   const [mode, setMode] = useState<AuthMode>("login");
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [selectedRole, setSelectedRole] = useState<UserRole>("user");
   const { toast } = useToast();
   const navigate = useNavigate();
 
@@ -57,20 +60,69 @@ const Auth = () => {
           });
         }
         
+        // Store user data with role in Firestore
+        const userDocRef = doc(db, "users", userCredential.user.uid);
+        await setDoc(userDocRef, {
+          email: formData.email,
+          displayName: formData.name || formData.email,
+          role: selectedRole,
+          createdAt: new Date().toISOString(),
+          friends: [],
+          friendRequests: []
+        });
+        
         toast({
           title: "Account created!",
-          description: "Welcome to EventVibe! Redirecting...",
+          description: `Welcome to EventVibe as ${selectedRole}! Redirecting...`,
         });
-        navigate("/user-dashboard");
+        
+        // Redirect based on role
+        if (selectedRole === "organizer") {
+          navigate("/organizer-team-selection");
+        } else if (selectedRole === "artist") {
+          navigate("/artist");
+        } else {
+          navigate("/user-dashboard");
+        }
         
       } else if (mode === "login") {
-        await signInWithEmailAndPassword(auth, formData.email, formData.password);
+        const userCredential = await signInWithEmailAndPassword(auth, formData.email, formData.password);
+        
+        // Fetch user role from Firestore
+        const userDocRef = doc(db, "users", userCredential.user.uid);
+        const userDoc = await getDoc(userDocRef);
+        
+        if (!userDoc.exists()) {
+          toast({
+            variant: "destructive",
+            title: "Error",
+            description: "User data not found.",
+          });
+          setIsLoading(false);
+          return;
+        }
+        
+        const userData = userDoc.data();
+        const userRole = userData.role || "user";
         
         toast({
           title: "Welcome back!",
           description: "Redirecting to your dashboard...",
         });
-        navigate("/user-dashboard");
+        
+        // Redirect based on role
+        if (userRole === "organizer") {
+          // Check if organizer has an event/team
+          if (userData.currentEventId) {
+            navigate("/organizer");
+          } else {
+            navigate("/organizer-team-selection");
+          }
+        } else if (userRole === "artist") {
+          navigate("/artist");
+        } else {
+          navigate("/user-dashboard");
+        }
         
       } else if (mode === "forgot") {
         await sendPasswordResetEmail(auth, formData.email);
@@ -158,19 +210,64 @@ const Auth = () => {
 
           <form onSubmit={handleSubmit} className="space-y-4">
             {mode === "signup" && (
-              <div className="relative">
-                <User className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
-                <Input
-                  type="text"
-                  placeholder="Full name"
-                  value={formData.name}
-                  onChange={(e) =>
-                    setFormData({ ...formData, name: e.target.value })
-                  }
-                  className="pl-11 h-12 bg-muted/50 border-border/50"
-                  required
-                />
-              </div>
+              <>
+                <div className="relative">
+                  <User className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                  <Input
+                    type="text"
+                    placeholder="Full name"
+                    value={formData.name}
+                    onChange={(e) =>
+                      setFormData({ ...formData, name: e.target.value })
+                    }
+                    className="pl-11 h-12 bg-muted/50 border-border/50"
+                    required
+                  />
+                </div>
+                
+                {/* Role Selection for Signup */}
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-foreground">Select your role</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedRole("user")}
+                      className={`p-3 rounded-lg border-2 transition-all ${
+                        selectedRole === "user"
+                          ? "border-primary bg-primary/10 text-primary"
+                          : "border-border/50 bg-muted/30 text-muted-foreground hover:border-primary/50"
+                      }`}
+                    >
+                      <Ticket className="w-5 h-5 mx-auto mb-1" />
+                      <span className="text-xs font-medium">User</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedRole("organizer")}
+                      className={`p-3 rounded-lg border-2 transition-all ${
+                        selectedRole === "organizer"
+                          ? "border-primary bg-primary/10 text-primary"
+                          : "border-border/50 bg-muted/30 text-muted-foreground hover:border-primary/50"
+                      }`}
+                    >
+                      <Building2 className="w-5 h-5 mx-auto mb-1" />
+                      <span className="text-xs font-medium">Organizer</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedRole("artist")}
+                      className={`p-3 rounded-lg border-2 transition-all ${
+                        selectedRole === "artist"
+                          ? "border-primary bg-primary/10 text-primary"
+                          : "border-border/50 bg-muted/30 text-muted-foreground hover:border-primary/50"
+                      }`}
+                    >
+                      <Music2 className="w-5 h-5 mx-auto mb-1" />
+                      <span className="text-xs font-medium">Artist</span>
+                    </button>
+                  </div>
+                </div>
+              </>
             )}
 
             <div className="relative">

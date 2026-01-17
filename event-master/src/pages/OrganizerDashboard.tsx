@@ -1,16 +1,23 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { 
-  ArrowLeft, MapPin, Users, Shield, Radio, Search, Filter, RefreshCw, QrCode, AlertOctagon, Plus
+  ArrowLeft, MapPin, Users, Shield, Radio, Search, RefreshCw, QrCode, 
+  AlertOctagon, Speaker, Zap, Wifi, ShoppingBag, Activity, AlertTriangle, CheckCircle,
+  Crown, MessageSquare, Send, X, Loader2, UserPlus, Plus, Heart
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle, CardFooter } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { db } from "@/lib/firebase";
-import { collection, onSnapshot, query, updateDoc, doc, addDoc } from "firebase/firestore";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
+import { auth, db } from "@/lib/firebase";
+import { 
+    collection, onSnapshot, query, updateDoc, doc, addDoc, getDoc,
+    orderBy, serverTimestamp, where
+} from "firebase/firestore";
+import { onAuthStateChanged, User as FirebaseUser } from "firebase/auth";
 import { useToast } from "@/hooks/use-toast";
 
 interface Attendee {
@@ -19,16 +26,17 @@ interface Attendee {
   name?: string;
   tier: "platinum" | "gold" | "silver" | "staff" | "security" | "medical" | "vip";
   position?: { x: number; y: number };
-  role?: string; 
   status?: string;
 }
 
-// Added Mock Security Data as requested
-const mockSecurity: Attendee[] = [
-  { id: "sec1", name: "Security Unit A", tier: "security", position: { x: 15, y: 15 }, status: "active" },
-  { id: "sec2", name: "Security Unit B", tier: "security", position: { x: 85, y: 15 }, status: "active" },
-  { id: "sec3", name: "Gate Control", tier: "security", position: { x: 50, y: 90 }, status: "active" },
-];
+interface ChatMessage {
+    id: string;
+    text: string;
+    sender: "organizer" | "vip";
+    createdAt: any;
+}
+
+// Staff management will be loaded from Firestore
 
 const tierColors: Record<string, string> = {
   platinum: "bg-purple-500 shadow-[0_0_10px_#a855f7]",
@@ -36,72 +44,256 @@ const tierColors: Record<string, string> = {
   silver: "bg-slate-400 shadow-[0_0_5px_#94a3b8]",
   staff: "bg-blue-500",
   security: "bg-red-600 border-2 border-white shadow-[0_0_10px_#dc2626]",
-  medical: "bg-green-500",
-  vip: "bg-purple-500"
+  medical: "bg-green-500 animate-pulse border-2 border-white",
+  vip: "bg-pink-500 border-2 border-white shadow-[0_0_15px_#ec4899] animate-bounce"
 };
 
 const OrganizerDashboard = () => {
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [currentEventId, setCurrentEventId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [people, setPeople] = useState<Attendee[]>([]);
   const [filterRole, setFilterRole] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [violations, setViolations] = useState<string[]>([]);
-  const { toast } = useToast();
+  const [sosAlerts, setSosAlerts] = useState<string[]>([]);
+  
+  // Tech & Merch States
+  const [merchQueue, setMerchQueue] = useState({ length: 12, waitTime: "5 min", sales: 45000 });
 
+  // Chat & VIP States
+  const [selectedVip, setSelectedVip] = useState<Attendee | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [newMessage, setNewMessage] = useState("");
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  
+  // Staff Management States
+  const [staff, setStaff] = useState<Attendee[]>([]);
+  const [isAssignStaffOpen, setIsAssignStaffOpen] = useState(false);
+  const [selectedStaffType, setSelectedStaffType] = useState<"security" | "medical" | null>(null);
+  const [staffName, setStaffName] = useState("");
+  const [clickedPosition, setClickedPosition] = useState<{ x: number; y: number } | null>(null);
+
+  const { toast } = useToast();
+  const navigate = useNavigate();
+
+  // 0. Check user and event access
   useEffect(() => {
-    // 1. Fetch Real Tickets
-    const qTickets = query(collection(db, "tickets"));
-    const unsubTickets = onSnapshot(qTickets, (snap) => {
-      const attendeesList: Attendee[] = [];
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (!currentUser) {
+        navigate("/auth");
+        return;
+      }
       
+      setUser(currentUser);
+      
+      // Check if user is organizer and has event
+      const userDoc = await getDoc(doc(db, "users", currentUser.uid));
+      if (!userDoc.exists() || userDoc.data().role !== "organizer") {
+        navigate("/auth");
+        return;
+      }
+      
+      const userData = userDoc.data();
+      if (!userData.currentEventId) {
+        // No event assigned, redirect to team selection
+        navigate("/organizer-team-selection");
+        return;
+      }
+      
+      setCurrentEventId(userData.currentEventId);
+      setLoading(false);
+    });
+    
+    return () => unsubscribe();
+  }, [navigate]);
+
+  // 1. Fetch Data - Filter by event
+  useEffect(() => {
+    if (!currentEventId || !user) return;
+    
+    // First get event details to find concertId
+    const eventDocRef = doc(db, "events", currentEventId);
+    getDoc(eventDocRef).then(eventDoc => {
+      if (!eventDoc.exists()) return;
+      
+      const eventData = eventDoc.data();
+      const concertId = eventData.eventId;
+      
+      // Verify organizer has access to this event (check if organizer is in organizers array)
+      const organizers = eventData.organizers || [];
+      if (!organizers.includes(user.uid)) {
+        console.warn("Organizer does not have access to this event");
+        return;
+      }
+        
+        // Fetch only active tickets (status: 'used') for this organizer's specific event
+        // This ensures organizers can ONLY see tickets from their own event
+        const qTickets = query(
+          collection(db, "tickets"),
+          where("concertId", "==", concertId),
+          where("status", "==", "used")
+        );
+        
+        const unsubTickets = onSnapshot(qTickets, (snap) => {
+          const attendeesList: Attendee[] = [];
+          snap.forEach((d) => {
+            const data = d.data();
+            
+            // Double validation: Only process tickets with status 'used' (active/inside)
+            if (data.status !== 'used') {
+              return;
+            }
+            
+            // Double validation: Ensure ticket's concertId matches organizer's event
+            // (This is redundant due to query filter, but adds extra security layer)
+            if (data.concertId !== concertId) {
+              console.warn("Ticket concertId mismatch - skipping", { ticketId: d.id, ticketConcertId: data.concertId, organizerConcertId: concertId });
+              return;
+            }
+        
+          // Use seat position if available - ensure people stay in their seat regions
+          let position: { x: number; y: number };
+          if (data.seat && data.seat.position) {
+            // Use assigned seat position - keep people in their seat regions
+            // Validate and ensure position is within tier boundaries
+            const tier = data.tier || "silver";
+            const seatPos = data.seat.position;
+            
+            // Tier-based position ranges (matching seat assignment logic)
+            const tierRanges: Record<string, { x: { min: number; max: number }; y: { min: number; max: number } }> = {
+              platinum: { x: { min: 30, max: 70 }, y: { min: 15, max: 35 } },
+              gold: { x: { min: 20, max: 80 }, y: { min: 40, max: 65 } },
+              silver: { x: { min: 10, max: 90 }, y: { min: 70, max: 95 } },
+              vip: { x: { min: 85, max: 95 }, y: { min: 10, max: 40 } }
+            };
+            
+            const range = tierRanges[tier] || tierRanges.silver;
+            
+            // Clamp position to tier boundaries if needed
+            position = {
+              x: Math.max(range.x.min, Math.min(range.x.max, seatPos.x || 50)),
+              y: Math.max(range.y.min, Math.min(range.y.max, seatPos.y || 50))
+            };
+          } else if (data.location) {
+            // Fall back to GPS-based position if no seat assigned
+            // Position based on tier for unassigned seats
+            const tier = data.tier || "silver";
+            const tierRanges: Record<string, { x: { min: number; max: number }; y: { min: number; max: number } }> = {
+              platinum: { x: { min: 30, max: 70 }, y: { min: 15, max: 35 } },
+              gold: { x: { min: 20, max: 80 }, y: { min: 40, max: 65 } },
+              silver: { x: { min: 10, max: 90 }, y: { min: 70, max: 95 } },
+              vip: { x: { min: 85, max: 95 }, y: { min: 10, max: 40 } }
+            };
+            
+            const range = tierRanges[tier] || tierRanges.silver;
+            const xCenter = (range.x.min + range.x.max) / 2;
+            const yCenter = (range.y.min + range.y.max) / 2;
+            
+            // Use GPS location but clamp to tier zone
+            const x = (Math.abs(data.location.lng * 1000) % (range.x.max - range.x.min)) + range.x.min;
+            const y = (Math.abs(data.location.lat * 1000) % (range.y.max - range.y.min)) + range.y.min;
+            position = { x, y };
+          } else {
+            // Default position in tier center if neither seat nor location available
+            const tier = data.tier || "silver";
+            const tierRanges: Record<string, { x: { min: number; max: number }; y: { min: number; max: number } }> = {
+              platinum: { x: { min: 30, max: 70 }, y: { min: 15, max: 35 } },
+              gold: { x: { min: 20, max: 80 }, y: { min: 40, max: 65 } },
+              silver: { x: { min: 10, max: 90 }, y: { min: 70, max: 95 } },
+              vip: { x: { min: 85, max: 95 }, y: { min: 10, max: 40 } }
+            };
+            
+            const range = tierRanges[tier] || tierRanges.silver;
+            position = {
+              x: (range.x.min + range.x.max) / 2,
+              y: (range.y.min + range.y.max) / 2
+            };
+          }
+
+          attendeesList.push({
+            id: d.id,
+            attendeeName: data.attendeeName || "Unknown Guest",
+            tier: data.tier || "silver",
+            position: position,
+            status: data.status || "active"
+          });
+        });
+        
+        // Merge staff with attendees (staff is fetched separately in useEffect)
+        const mergedList = [...staff, ...attendeesList];
+        setPeople(mergedList);
+        checkViolations(mergedList);
+      });
+
+      return () => unsubTickets();
+    });
+  }, [currentEventId, user, staff]);
+
+  // 1.5. Fetch Staff for this event
+  useEffect(() => {
+    if (!currentEventId) return;
+    
+    const qStaff = query(
+      collection(db, "staff"),
+      where("eventId", "==", currentEventId),
+      where("status", "==", "active")
+    );
+    
+    const unsubStaff = onSnapshot(qStaff, (snap) => {
+      const staffList: Attendee[] = [];
       snap.forEach((d) => {
         const data = d.data();
-        const x = data.location ? (Math.abs(data.location.lng * 1000) % 90) + 5 : 50;
-        const y = data.location ? (Math.abs(data.location.lat * 1000) % 90) + 5 : 50;
-
-        attendeesList.push({
-          id: d.id,
-          attendeeName: data.attendeeName || "Unknown Guest",
-          tier: data.tier || "silver",
-          position: { x, y },
-          status: "active"
-        });
+        if (data.status === "active") {
+          staffList.push({
+            id: d.id,
+            name: data.name,
+            tier: data.tier as "security" | "medical",
+            position: data.position || { x: 50, y: 50 },
+            status: data.status || "active"
+          });
+        }
       });
-      
-      // 2. Merge Real Attendees with Mock Security
-      const mergedList = [...mockSecurity, ...attendeesList];
-      setPeople(mergedList);
-      checkViolations(mergedList);
+      setStaff(staffList);
+    });
+    
+    return () => unsubStaff();
+  }, [currentEventId]);
+
+  // 2. Chat Listener
+  useEffect(() => {
+    if (!selectedVip) return;
+
+    const qChat = query(
+        collection(db, "messages"), 
+        where("ticketId", "==", selectedVip.id),
+        orderBy("createdAt", "asc")
+    );
+
+    const unsubChat = onSnapshot(qChat, (snap) => {
+        const msgs = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as ChatMessage));
+        setChatMessages(msgs);
+        setTimeout(() => chatScrollRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
     });
 
-    return () => unsubTickets();
-  }, []);
+    return () => unsubChat();
+  }, [selectedVip]);
 
   const checkViolations = (currentList: Attendee[]) => {
     const newViolations: string[] = [];
-    
     currentList.forEach(person => {
-      if (!person.position) return;
-      if (person.tier === 'security') return; // Security can go anywhere
+      if (!person.position || ['security', 'medical', 'vip', 'staff'].includes(person.tier)) return;
 
       const { x, y } = person.position;
+      // Define Zone Boundaries for Alerts
+      const inPlatinum = x > 25 && x < 75 && y > 10 && y < 40;
+      const inGold = x > 15 && x < 85 && y >= 40 && y < 70;
       
-      const inPlatinumZone = x > 30 && x < 70 && y < 30;
-      const inGoldZone = x > 20 && x < 80 && y >= 30 && y < 60;
-
-      if (person.tier === 'silver' && inPlatinumZone) {
-        newViolations.push(`${person.attendeeName || 'Guest'} (Silver) unauthorized in Platinum VIP Area!`);
-      }
-      if (person.tier === 'silver' && inGoldZone) {
-        newViolations.push(`${person.attendeeName || 'Guest'} (Silver) unauthorized in Gold Area!`);
+      if (person.tier === 'silver' && (inPlatinum || inGold)) {
+          newViolations.push(`${person.attendeeName} (Silver) in Restricted Area`);
       }
     });
-
-    if (newViolations.length > 0 && newViolations.length !== violations.length) {
-      setViolations(newViolations);
-      toast({ variant: "destructive", title: "Security Alert", description: `${newViolations.length} zone violations.` });
-    } else if (newViolations.length === 0) {
-      setViolations([]);
-    }
+    if (newViolations.length > 0 && newViolations.length !== violations.length) setViolations(newViolations);
   };
 
   const simulateMovement = () => {
@@ -113,7 +305,94 @@ const OrganizerDashboard = () => {
         }
     }));
     setPeople(moved);
-    checkViolations(moved);
+  };
+
+  const markAsVIP = async (ticketId: string) => {
+    try {
+        const ticketRef = doc(db, "tickets", ticketId);
+        await updateDoc(ticketRef, { tier: "vip" });
+        toast({ title: "User Promoted!", description: "They are now a VIP. You can chat with them." });
+    } catch (error) { console.error("Error promoting:", error); }
+  };
+
+  const sendChatMessage = async () => {
+      if(!newMessage.trim() || !selectedVip) return;
+      try {
+          await addDoc(collection(db, "messages"), {
+              ticketId: selectedVip.id,
+              text: newMessage,
+              sender: "organizer",
+              createdAt: serverTimestamp()
+          });
+          setNewMessage("");
+      } catch (e) { console.error("Send failed", e); }
+  };
+
+  // --- STAFF ASSIGNMENT FUNCTIONS ---
+  
+  const handleMapClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!isAssignStaffOpen) return;
+    
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * 100;
+    const y = ((e.clientY - rect.top) / rect.height) * 100;
+    
+    const position = { x: Math.max(0, Math.min(100, x)), y: Math.max(0, Math.min(100, y)) };
+    setClickedPosition(position);
+  };
+
+  const assignStaff = async () => {
+    if (!selectedStaffType || !staffName.trim() || !clickedPosition || !currentEventId) return;
+    
+    try {
+      await addDoc(collection(db, "staff"), {
+        eventId: currentEventId,
+        name: staffName.trim(),
+        tier: selectedStaffType,
+        position: clickedPosition,
+        status: "active",
+        assignedAt: serverTimestamp(),
+        assignedBy: user?.uid
+      });
+      
+      toast({
+        title: "Staff assigned!",
+        description: `${staffName} (${selectedStaffType}) assigned to position.`,
+      });
+      
+      setIsAssignStaffOpen(false);
+      setSelectedStaffType(null);
+      setStaffName("");
+      setClickedPosition(null);
+    } catch (error) {
+      console.error("Error assigning staff:", error);
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: "Failed to assign staff.",
+      });
+    }
+  };
+
+  const removeStaff = async (staffId: string) => {
+    try {
+      // Delete staff document
+      await updateDoc(doc(db, "staff", staffId), {
+        status: "inactive"
+      });
+      
+      toast({
+        title: "Staff removed",
+        description: "Staff member has been removed from the map.",
+      });
+    } catch (error) {
+      console.error("Error removing staff:", error);
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: "Failed to remove staff.",
+      });
+    }
   };
 
   const filteredPeople = people.filter((p) => {
@@ -123,187 +402,305 @@ const OrganizerDashboard = () => {
     return matchesRole && matchesSearch;
   });
 
-  const stats = {
-    total: people.length,
-    platinum: people.filter(p => p.tier === 'platinum').length,
-    gold: people.filter(p => p.tier === 'gold').length,
-    violations: violations.length
-  };
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <Loader2 className="w-8 h-8 animate-spin text-white" />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-950 text-white flex flex-col">
       <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-sm sticky top-0 z-50">
         <div className="container mx-auto px-4 py-4 flex justify-between items-center">
             <div className="flex items-center gap-4">
-              <Link to="/">
-                <Button variant="ghost" size="icon" className="text-slate-400 hover:text-white">
-                  <ArrowLeft className="w-5 h-5" />
-                </Button>
-              </Link>
-              <div>
-                <h1 className="text-2xl font-bold">Organizer Monitor</h1>
-                <p className="text-sm text-slate-400">Security & Live Tracking</p>
-              </div>
+              <Link to="/"><Button variant="ghost" size="icon" className="text-slate-400"><ArrowLeft className="w-5 h-5" /></Button></Link>
+              <div><h1 className="text-2xl font-bold">Organizer Command Center</h1><p className="text-sm text-slate-400">Crowd Safety & Live Ops</p></div>
             </div>
-            
             <div className="flex gap-2">
-                <Link to="/scanner">
-                    <Button className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white shadow-md shadow-indigo-500/20 border-0">
-                        <QrCode className="w-4 h-4" /> Scan
-                    </Button>
-                </Link>
-                <Button onClick={simulateMovement} variant="outline" className="gap-2 border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800">
-                    <RefreshCw className="w-4 h-4" /> Sim Move
+                <Button 
+                    onClick={() => setIsAssignStaffOpen(true)} 
+                    variant="outline" 
+                    className="border-green-700 text-green-400 hover:bg-green-600 hover:text-white"
+                >
+                    <Plus className="w-4 h-4 mr-2" /> Assign Staff
                 </Button>
+                <Button onClick={simulateMovement} variant="outline" className="border-slate-700 text-slate-300"><RefreshCw className="w-4 h-4 mr-2" /> Simulate</Button>
+                <Link to="/scanner"><Button className="bg-indigo-600 hover:bg-indigo-700"><QrCode className="w-4 h-4 mr-2" /> Scan Ticket</Button></Link>
             </div>
         </div>
       </header>
 
-      <main className="container mx-auto px-4 py-8 flex-1">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-            <Card className="bg-slate-900 border-slate-800">
-                <CardContent className="pt-6 flex items-center gap-4">
-                    <div className="p-3 bg-blue-500/20 text-blue-400 rounded-full"><Users className="w-6 h-6"/></div>
-                    <div><p className="text-2xl font-bold text-white">{stats.total}</p><p className="text-xs text-slate-400">Total People</p></div>
-                </CardContent>
-            </Card>
-            <Card className="bg-slate-900 border-slate-800">
-                <CardContent className="pt-6 flex items-center gap-4">
-                    <div className="p-3 bg-purple-500/20 text-purple-400 rounded-full"><Shield className="w-6 h-6"/></div>
-                    <div><p className="text-2xl font-bold text-white">{stats.platinum}</p><p className="text-xs text-slate-400">Platinum VIP</p></div>
-                </CardContent>
-            </Card>
-            <Card className="bg-slate-900 border-slate-800">
-                <CardContent className="pt-6 flex items-center gap-4">
-                    <div className="p-3 bg-yellow-500/20 text-yellow-400 rounded-full"><Shield className="w-6 h-6"/></div>
-                    <div><p className="text-2xl font-bold text-white">{stats.gold}</p><p className="text-xs text-slate-400">Gold Guests</p></div>
-                </CardContent>
-            </Card>
-            <Card className={`bg-slate-900 border-slate-800 ${stats.violations > 0 ? 'border-red-500/50 bg-red-900/10' : ''}`}>
-                <CardContent className="pt-6 flex items-center gap-4">
-                    <div className={`p-3 rounded-full ${stats.violations > 0 ? 'bg-red-500/20 text-red-500 animate-pulse' : 'bg-slate-800 text-slate-500'}`}>
-                        <AlertOctagon className="w-6 h-6"/>
-                    </div>
-                    <div><p className="text-2xl font-bold text-white">{stats.violations}</p><p className="text-xs text-slate-400">Active Alerts</p></div>
-                </CardContent>
-            </Card>
-        </div>
-
-        <div className="grid lg:grid-cols-3 gap-8">
-          <div className="lg:col-span-2 space-y-4">
-             <AnimatePresence>
-                {violations.length > 0 && (
-                    <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="bg-red-900/80 border border-red-500 text-white p-4 rounded-lg shadow-lg flex items-start gap-3">
-                        <AlertOctagon className="w-6 h-6 mt-1 flex-shrink-0 animate-bounce" />
-                        <div>
-                            <h3 className="font-bold">SECURITY ALERT: ZONE VIOLATION</h3>
-                            <ul className="list-disc pl-5 text-sm mt-1 opacity-90">
-                                {violations.map((v, i) => <li key={i}>{v}</li>)}
-                            </ul>
-                        </div>
+      <main className="container mx-auto px-4 py-8 grid lg:grid-cols-4 gap-6 h-[calc(100vh-80px)]">
+        
+        {/* LEFT COLUMN: MAP & ALERTS */}
+        <div className="lg:col-span-3 space-y-6 h-full overflow-y-auto pr-2">
+            
+            <AnimatePresence>
+                {sosAlerts.length > 0 && (
+                    <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} className="bg-red-950 border border-red-500 rounded-lg p-4 flex items-center gap-4 animate-pulse">
+                        <AlertTriangle className="w-8 h-8 text-red-500" />
+                        <div><h3 className="text-red-500 font-bold text-lg">EMERGENCY SOS ACTIVE</h3><p className="text-red-300">{sosAlerts[0]}</p></div>
+                        <Button variant="destructive" size="sm" onClick={() => setSosAlerts([])}>Resolve</Button>
                     </motion.div>
                 )}
-             </AnimatePresence>
+            </AnimatePresence>
 
-             <Card className="overflow-hidden border-slate-800 bg-slate-900 shadow-xl">
-                <CardHeader className="bg-slate-900 border-b border-slate-800">
-                    <CardTitle className="flex items-center gap-2 text-white">
-                        <MapPin className="w-5 h-5 text-indigo-400" /> Venue Heatmap
-                    </CardTitle>
+            {/* MAIN MAP */}
+            <Card className="border-slate-800 bg-slate-900 shadow-xl overflow-hidden min-h-[500px]">
+                <CardHeader className="flex flex-row items-center justify-between border-b border-slate-800 py-3">
+                    <CardTitle className="flex items-center gap-2 text-white text-base"><MapPin className="w-4 h-4 text-indigo-400" /> Venue Map</CardTitle>
+                    <div className="flex gap-2">
+                        <Badge variant="outline" className="text-purple-400 border-purple-900 bg-purple-900/20">Platinum</Badge>
+                        <Badge variant="outline" className="text-yellow-400 border-yellow-900 bg-yellow-900/20">Gold</Badge>
+                        <Badge variant="outline" className="text-slate-400 border-slate-900 bg-slate-900/20">Silver</Badge>
+                        <Badge variant="outline" className="text-pink-400 border-pink-900 bg-pink-900/20">VIP Box</Badge>
+                    </div>
                 </CardHeader>
-                <CardContent className="p-0 relative aspect-[16/9] bg-black">
-                    {/* --- MAP ZONES --- */}
-                    <div className="absolute inset-0 pointer-events-none">
+                <CardContent 
+                    className="p-0 relative h-[500px] bg-black cursor-crosshair"
+                    onClick={isAssignStaffOpen ? handleMapClick : undefined}
+                >
+                    {/* ZONES OVERLAY */}
+                    <div className="absolute inset-0 pointer-events-none opacity-30">
                         {/* Stage */}
-                        <div className="absolute top-0 left-1/4 right-1/4 h-12 bg-slate-800 rounded-b-xl flex items-center justify-center border-b border-x border-slate-700">
-                            <span className="text-slate-500 text-[10px] tracking-[0.3em] font-bold">MAIN STAGE</span>
-                        </div>
-
-                        {/* Platinum */}
-                        <div className="absolute top-12 left-[30%] right-[30%] h-[30%] border-2 border-dashed border-purple-500/40 bg-purple-900/20">
-                            <div className="absolute top-2 right-2 text-purple-400 text-[10px] font-bold border border-purple-500/50 px-1 rounded">PLATINUM</div>
-                        </div>
-
-                        {/* Gold */}
-                        <div className="absolute top-[40%] left-[20%] right-[20%] h-[25%] border-2 border-dashed border-yellow-500/40 bg-yellow-900/10">
-                             <div className="absolute top-2 right-2 text-yellow-500 text-[10px] font-bold border border-yellow-500/50 px-1 rounded">GOLD</div>
-                        </div>
+                        <div className="absolute top-0 left-1/3 right-1/3 h-12 bg-slate-800 border-b-2 border-slate-600 flex items-center justify-center"><span className="text-xs font-bold text-white tracking-[0.5em]">STAGE</span></div>
                         
-                         {/* SILVER / GENERAL SEATING - Explicitly Labeled UI */}
-                        <div className="absolute bottom-0 left-[5%] right-[5%] h-[30%] border-t-2 border-slate-700 bg-slate-900/30 flex justify-center items-end pb-2">
-                             <span className="text-slate-400 text-xs font-bold tracking-widest bg-black/60 px-3 py-1 rounded-full mb-2">SILVER / GENERAL SEATING</span>
+                        {/* Platinum Zone (Front) */}
+                        <div className="absolute top-[12%] left-[25%] right-[25%] h-[25%] border-2 border-dashed border-purple-500 bg-purple-900/20 flex items-center justify-center">
+                            <span className="text-purple-300 font-bold text-xs">PLATINUM</span>
+                        </div>
+
+                        {/* Gold Zone (Middle) */}
+                        <div className="absolute top-[40%] left-[15%] right-[15%] h-[30%] border-2 border-dashed border-yellow-500 bg-yellow-900/20 flex items-center justify-center">
+                            <span className="text-yellow-300 font-bold text-xs">GOLD</span>
+                        </div>
+
+                        {/* Silver Zone (Back) */}
+                        <div className="absolute bottom-[5%] left-[10%] right-[10%] h-[20%] border-2 border-dashed border-slate-500 bg-slate-900/20 flex items-center justify-center">
+                            <span className="text-slate-300 font-bold text-xs">SILVER</span>
+                        </div>
+
+                        {/* VIP Box (Side) */}
+                        <div className="absolute top-[10%] right-[5%] w-[15%] h-[40%] border-2 border-double border-pink-500 bg-pink-900/30 flex items-center justify-center">
+                             <span className="text-pink-300 font-bold text-xs rotate-90">VIP BOX</span>
                         </div>
                     </div>
 
-                    {/* --- PEOPLE DOTS --- */}
-                    {filteredPeople.map((person) => (
+                    {/* PEOPLE DOTS */}
+                    {filteredPeople.map((p) => (
                         <motion.div
-                            key={person.id}
+                            key={p.id}
                             layout
                             initial={{ scale: 0 }}
-                            animate={{ scale: 1, left: `${person.position?.x}%`, top: `${person.position?.y}%` }}
-                            transition={{ type: "spring", damping: 20, stiffness: 100 }}
-                            className={`absolute w-3 h-3 -ml-1.5 -mt-1.5 rounded-full cursor-pointer group ${tierColors[person.tier] || "bg-white"}`}
+                            animate={{ scale: p.tier === 'vip' ? 1.5 : 1, left: `${p.position?.x}%`, top: `${p.position?.y}%` }}
+                            transition={{ type: "spring", damping: 20 }}
+                            className={`absolute w-3 h-3 -ml-1.5 -mt-1.5 rounded-full ${tierColors[p.tier] || "bg-white"} cursor-pointer z-10 hover:z-50 border border-black/50`}
+                            title={`${p.attendeeName || p.name || "Unknown"} (${p.tier})`}
+                            onClick={(e) => {
+                                e.stopPropagation(); // Prevent map click when clicking on person
+                                if(p.tier === 'vip') setSelectedVip(p);
+                                else if(['security', 'medical'].includes(p.tier) && p.id) {
+                                    // Allow removing staff
+                                    if(confirm(`Remove ${p.name} from the map?`)) {
+                                        removeStaff(p.id);
+                                    }
+                                } else {
+                                    toast({ title: p.attendeeName || p.name, description: `Status: ${p.tier.toUpperCase()}` });
+                                }
+                            }}
                         >
-                            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block bg-black/90 border border-slate-700 text-white text-[10px] px-2 py-1 rounded whitespace-nowrap z-20">
-                                {person.attendeeName || person.name} ({person.tier})
-                            </div>
-                            {violations.some(v => v.includes(person.attendeeName || 'xyz')) && (
-                                <div className="absolute -inset-2 rounded-full border-2 border-red-500 animate-ping"></div>
-                            )}
+                            {p.tier === 'vip' && <Crown className="w-4 h-4 text-yellow-400 absolute -top-4 -left-0.5 drop-shadow-md" />}
+                            {p.tier === 'security' && <Shield className="w-3 h-3 text-white absolute -top-3 -left-1" />}
+                            {p.tier === 'medical' && <Heart className="w-3 h-3 text-white absolute -top-3 -left-1" />}
                         </motion.div>
                     ))}
                 </CardContent>
-             </Card>
-          </div>
+            </Card>
 
-          <div className="space-y-4">
-             <div className="bg-slate-900 p-4 rounded-xl border border-slate-800 space-y-4">
-                 <div className="flex gap-2">
-                    <div className="relative flex-1">
-                        <Search className="absolute left-2 top-2.5 w-4 h-4 text-slate-500" />
-                        <Input 
-                            placeholder="Search..." 
-                            className="pl-8 bg-slate-950 border-slate-800 text-white placeholder:text-slate-600 focus-visible:ring-indigo-500" 
-                            value={searchQuery} 
-                            onChange={e => setSearchQuery(e.target.value)} 
-                        />
-                    </div>
-                    <Select value={filterRole} onValueChange={setFilterRole}>
-                        <SelectTrigger className="w-[110px] bg-slate-950 border-slate-800 text-white"><SelectValue /></SelectTrigger>
-                        <SelectContent className="bg-slate-900 border-slate-800 text-white">
-                            <SelectItem value="all">All</SelectItem>
-                            <SelectItem value="security">Security</SelectItem>
-                            <SelectItem value="platinum">Platinum</SelectItem>
-                            <SelectItem value="gold">Gold</SelectItem>
-                            <SelectItem value="silver">Silver</SelectItem>
-                        </SelectContent>
-                    </Select>
-                 </div>
-
-                 <div className="space-y-2 max-h-[500px] overflow-y-auto pr-2">
-                    {filteredPeople.map(p => (
-                        <div key={p.id} className="flex items-center justify-between p-2 rounded hover:bg-slate-800 transition-colors border border-transparent hover:border-slate-700">
-                            <div className="flex items-center gap-3">
-                                <div className={`w-8 h-8 rounded-full flex items-center justify-center text-[10px] font-bold text-white ${tierColors[p.tier] || 'bg-slate-400'}`}>
-                                    {p.tier === 'security' ? <Shield className="w-4 h-4"/> : (p.attendeeName?.[0] || p.name?.[0] || "?")}
-                                </div>
-                                <div>
-                                    <p className="text-sm font-medium text-slate-200">{p.attendeeName || p.name}</p>
-                                    <p className="text-[10px] text-slate-500 uppercase tracking-wider">{p.tier}</p>
-                                </div>
-                            </div>
-                            {p.tier === 'security' && <Badge className="bg-red-900/50 text-red-200 border-red-800 text-[10px]">STAFF</Badge>}
+            {/* RESTORED TECH STATUS CARDS */}
+            <div className="grid md:grid-cols-3 gap-4">
+                <Card className="bg-slate-900 border-slate-800">
+                    <CardContent className="p-4 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="p-2 bg-blue-500/20 rounded-full text-blue-400"><Speaker className="w-5 h-5" /></div>
+                            <div><p className="font-bold text-white">Sound</p><p className="text-xs text-slate-400">Line Array: OK</p></div>
                         </div>
-                    ))}
-                    {filteredPeople.length === 0 && (
-                        <p className="text-center text-sm text-slate-500 py-8">No matching records.</p>
-                    )}
-                 </div>
-             </div>
-          </div>
+                        <CheckCircle className="w-5 h-5 text-green-500" />
+                    </CardContent>
+                </Card>
+                <Card className="bg-slate-900 border-slate-800">
+                    <CardContent className="p-4 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="p-2 bg-yellow-500/20 rounded-full text-yellow-400"><Zap className="w-5 h-5" /></div>
+                            <div><p className="font-bold text-white">Lights</p><p className="text-xs text-slate-400">DMX: 100%</p></div>
+                        </div>
+                        <CheckCircle className="w-5 h-5 text-green-500" />
+                    </CardContent>
+                </Card>
+                <Card className="bg-slate-900 border-slate-800">
+                    <CardContent className="p-4 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="p-2 bg-purple-500/20 rounded-full text-purple-400"><Wifi className="w-5 h-5" /></div>
+                            <div><p className="font-bold text-white">Stream</p><p className="text-xs text-slate-400">6000kbps</p></div>
+                        </div>
+                        <Activity className="w-5 h-5 text-green-500 animate-pulse" />
+                    </CardContent>
+                </Card>
+            </div>
+        </div>
+
+        {/* RIGHT COLUMN: LISTS & CHAT */}
+        <div className="space-y-6 h-full flex flex-col">
+            
+            {/* VIP CHAT WINDOW */}
+            <AnimatePresence mode="wait">
+                {selectedVip ? (
+                    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} className="flex-1 flex flex-col">
+                        <Card className="bg-slate-900 border-pink-500/50 flex-1 flex flex-col shadow-[0_0_20px_rgba(236,72,153,0.1)]">
+                            <CardHeader className="pb-3 border-b border-slate-800 bg-pink-950/20 flex flex-row items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                    <Crown className="w-5 h-5 text-yellow-400" />
+                                    <div><CardTitle className="text-sm font-bold text-white">{selectedVip.attendeeName}</CardTitle><p className="text-[10px] text-pink-300">VIP Direct Line</p></div>
+                                </div>
+                                <Button size="icon" variant="ghost" className="h-6 w-6" onClick={() => setSelectedVip(null)}><X className="w-4 h-4" /></Button>
+                            </CardHeader>
+                            <CardContent className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-950/50">
+                                {chatMessages.length === 0 && <p className="text-center text-xs text-slate-500 mt-4">Start a conversation...</p>}
+                                {chatMessages.map(msg => (
+                                    <div key={msg.id} className={`flex ${msg.sender === 'organizer' ? 'justify-end' : 'justify-start'}`}>
+                                        <div className={`max-w-[80%] p-2 rounded-lg text-xs ${msg.sender === 'organizer' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-slate-800 text-slate-200 rounded-bl-none'}`}>{msg.text}</div>
+                                    </div>
+                                ))}
+                                <div ref={chatScrollRef} />
+                            </CardContent>
+                            <CardFooter className="p-2 border-t border-slate-800 bg-slate-900">
+                                <form className="flex w-full gap-2" onSubmit={(e) => { e.preventDefault(); sendChatMessage(); }}>
+                                    <Input placeholder="Message VIP..." className="h-8 bg-slate-950 border-slate-700 text-xs" value={newMessage} onChange={e => setNewMessage(e.target.value)} />
+                                    <Button type="submit" size="icon" className="h-8 w-8 bg-pink-600 hover:bg-pink-700"><Send className="w-3 h-3" /></Button>
+                                </form>
+                            </CardFooter>
+                        </Card>
+                    </motion.div>
+                ) : (
+                    <Card className="bg-slate-900 border-slate-800 flex-1 flex flex-col min-h-0">
+                        <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-slate-400 flex items-center gap-2"><Users className="w-4 h-4" /> Guest & Staff List</CardTitle></CardHeader>
+                        <div className="px-4 pb-2"><Input placeholder="Search..." className="bg-slate-950 border-slate-800 h-8 text-xs" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} /></div>
+                        <CardContent className="flex-1 overflow-y-auto space-y-2 p-2">
+                            {filteredPeople.map((p) => (
+                                <div key={p.id} className="bg-slate-950 p-2 rounded flex items-center justify-between group hover:bg-slate-800 transition-colors">
+                                    <div className="flex items-center gap-3">
+                                        <div className={`w-2 h-2 rounded-full ${tierColors[p.tier] || 'bg-slate-500'}`}></div>
+                                        <div><p className="text-xs font-bold text-white">{p.attendeeName || p.name}</p><p className="text-[10px] text-slate-500 capitalize">{p.tier}</p></div>
+                                    </div>
+                                    <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                        {!['vip','staff','security','medical'].includes(p.tier) && (
+                                            <Button size="icon" variant="ghost" className="h-6 w-6 hover:text-yellow-400 hover:bg-yellow-400/10" onClick={() => markAsVIP(p.id)} title="Promote to VIP"><Crown className="w-3 h-3" /></Button>
+                                        )}
+                                        {p.tier === 'vip' && (
+                                            <Button size="icon" variant="ghost" className="h-6 w-6 text-pink-400 hover:bg-pink-400/10" onClick={() => setSelectedVip(p)} title="Open Chat"><MessageSquare className="w-3 h-3" /></Button>
+                                        )}
+                                    </div>
+                                </div>
+                            ))}
+                        </CardContent>
+                    </Card>
+                )}
+            </AnimatePresence>
+
+            {/* MERCH STATS */}
+            <Card className="bg-slate-900 border-slate-800 shrink-0">
+                <CardContent className="p-4 flex justify-between items-center">
+                    <div><p className="text-xs text-slate-400">Merch Sales</p><p className="text-xl font-bold text-white">₹{merchQueue.sales.toLocaleString()}</p></div>
+                    <ShoppingBag className="w-8 h-8 text-indigo-500 opacity-50" />
+                </CardContent>
+            </Card>
+
         </div>
       </main>
+
+      {/* STAFF ASSIGNMENT DIALOG */}
+      <Dialog open={isAssignStaffOpen} onOpenChange={setIsAssignStaffOpen}>
+        <DialogContent className="bg-slate-900 border-slate-800 text-white">
+          <DialogHeader>
+            <DialogTitle>Assign Staff to Location</DialogTitle>
+            <DialogDescription className="text-slate-400">
+              Select staff type, enter name, then click on the map to position them
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <label className="text-sm font-medium text-slate-300 mb-2 block">Staff Type</label>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  type="button"
+                  onClick={() => setSelectedStaffType("security")}
+                  variant={selectedStaffType === "security" ? "default" : "outline"}
+                  className={selectedStaffType === "security" ? "bg-red-600 hover:bg-red-700" : "border-slate-700"}
+                >
+                  <Shield className="w-4 h-4 mr-2" />
+                  Security
+                </Button>
+                <Button
+                  type="button"
+                  onClick={() => setSelectedStaffType("medical")}
+                  variant={selectedStaffType === "medical" ? "default" : "outline"}
+                  className={selectedStaffType === "medical" ? "bg-green-600 hover:bg-green-700" : "border-slate-700"}
+                >
+                  <Heart className="w-4 h-4 mr-2" />
+                  Medical
+                </Button>
+              </div>
+            </div>
+            
+            <div>
+              <label className="text-sm font-medium text-slate-300 mb-2 block">Staff Name</label>
+              <Input
+                placeholder="Enter staff name"
+                value={staffName}
+                onChange={(e) => setStaffName(e.target.value)}
+                className="bg-slate-950 border-slate-700 text-white"
+              />
+            </div>
+            
+            {clickedPosition && (
+              <div className="bg-slate-800 p-3 rounded-lg">
+                <p className="text-xs text-slate-400">Selected Position:</p>
+                <p className="text-sm text-white">X: {clickedPosition.x.toFixed(1)}%, Y: {clickedPosition.y.toFixed(1)}%</p>
+              </div>
+            )}
+            
+            <p className="text-xs text-slate-500">
+              {clickedPosition 
+                ? "Click 'Assign Staff' to confirm, or click on the map to change position"
+                : "Click anywhere on the map to set the position"}
+            </p>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setIsAssignStaffOpen(false);
+                setSelectedStaffType(null);
+                setStaffName("");
+                setClickedPosition(null);
+              }}
+              className="border-slate-700"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={assignStaff}
+              disabled={!selectedStaffType || !staffName.trim() || !clickedPosition}
+              className="bg-indigo-600 hover:bg-indigo-700"
+            >
+              <UserPlus className="w-4 h-4 mr-2" />
+              Assign Staff
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };
